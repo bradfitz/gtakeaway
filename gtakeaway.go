@@ -398,32 +398,6 @@ func (c *Client) streamRange(ctx context.Context, df *drive.File, start, endIncl
 	return nil, fmt.Errorf("unexpected HTTP status %d downloading (%v,%v) range [%d,%d]", resp.StatusCode, df.Id, df.HeadRevisionId, start, endInclusive)
 }
 
-func listFolder(ctx context.Context, svc *drive.Service, folderID string) error {
-	pageToken := ""
-	for {
-		r, err := svc.Files.List().
-			Context(ctx).
-			Q(fmt.Sprintf("'%s' in parents and trashed = false", folderID)).
-			Fields("nextPageToken, files(id,name,mimeType,modifiedTime,size)").
-			PageSize(1000).
-			PageToken(pageToken).
-			Do()
-		if err != nil {
-			return err
-		}
-
-		for _, f := range r.Files {
-			fmt.Printf("%-40s %-60s %s\n", f.Id, f.Name, f.MimeType)
-		}
-
-		if r.NextPageToken == "" {
-			break
-		}
-		pageToken = r.NextPageToken
-	}
-	return nil
-}
-
 func (c *Client) iterFolder(ctx context.Context, folderID string) iter.Seq2[*drive.File, error] {
 	nFiles := 0
 	return func(yield func(*drive.File, error) bool) {
