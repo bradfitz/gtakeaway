@@ -153,7 +153,18 @@ func main() {
 			log.Fatalf("PrintExportStats: %v", err)
 		}
 		return
+	}
 
+	if mode == "download" {
+		takeoutName, localDir := args[1], args[2]
+		exp, ok := exportWithName(exports, takeoutName)
+		if !ok {
+			log.Fatalf("no export found with name %q; run 'gtakeaway list' to see available exports", takeoutName)
+		}
+		if err := c.DownloadTakeout(ctx, exp, localDir); err != nil {
+			log.Fatalf("DownloadTakeout: %v", err)
+		}
+		return
 	}
 
 	// if *listZips {
@@ -619,8 +630,8 @@ func (c *Client) PrintExportStats(ctx context.Context, exp *Export) error {
 	var sumUncompressed int64
 	var byType = make(map[string]int)
 	var folders = make(map[string]bool)
-	for _, zf := range zips {
-		for _, f := range zf.File {
+	for _, zar := range zips {
+		for _, f := range zar.Reader.File {
 			numFiles++
 			sumUncompressed += int64(f.UncompressedSize64)
 			if ext := strings.ToLower(path.Ext(f.Name)); ext != "" {
@@ -642,8 +653,100 @@ func (c *Client) PrintExportStats(ctx context.Context, exp *Export) error {
 	return nil
 }
 
-func (c *Client) readExportZipTOCs(ctx context.Context, exp *Export) (map[string]*ziputil.Reader, error) {
-	zips := make(map[string]*ziputil.Reader)
+type Stats struct {
+	NumFiles          int64
+	BytesCompressed   int64
+	BytesUncompressed int64
+}
+
+func (c *Client) DownloadTakeout(ctx context.Context, exp *Export, localDir string) error {
+	if fi, err := os.Stat(localDir); err != nil {
+		return err
+	} else if !fi.IsDir() {
+		return fmt.Errorf("%q is not a directory", localDir)
+	}
+	zips, err := c.readExportZipTOCs(ctx, exp)
+	if err != nil {
+		return fmt.Errorf("readExportZipTOCs: %w", err)
+	}
+	var total Stats
+	var done Stats
+	var todo []DownloadableItem
+	for _, far := range zips {
+		for _, fh := range far.Reader.File {
+			total.NumFiles++
+			total.BytesCompressed += int64(fh.CompressedSize64)
+			total.BytesUncompressed += int64(fh.UncompressedSize64)
+
+			dst := filepath.Join(localDir, fh.Name)
+			if fi, err := os.Stat(dst); err == nil {
+				if fi.Size() == int64(fh.UncompressedSize64) {
+					done.NumFiles++
+					done.BytesUncompressed += int64(fh.UncompressedSize64)
+					done.BytesCompressed += int64(fh.CompressedSize64)
+					continue
+				}
+			}
+			todo = append(todo, DownloadableItem{
+				DriveFile: far.File,
+				Zip:       far.Reader,
+				Header:    fh,
+			})
+		}
+	}
+
+	for _, item := range todo {
+		log.Printf("Downloading from zip %q ...", item.DriveFile.Name)
+		if path.Clean(item.Header.Name) != item.Header.Name {
+			return fmt.Errorf("invalid file name %q", item.Header.Name)
+		}
+		dst := filepath.Join(localDir, item.Header.Name)
+		if err := c.downloadItem(ctx, item, dst); err != nil {
+			return fmt.Errorf("downloadItem(%q): %w", item.Header.Name, err)
+		}
+	}
+	return nil
+}
+
+func (c *Client) downloadItem(ctx context.Context, item DownloadableItem, dst string) error {
+	zfd, err := ziputil.OpenWithReader(item.Header, func(offsize, size int64) (rawReader io.ReadCloser, err error) {
+		return c.streamRange(ctx, item.DriveFile, offsize, offsize+size-1)
+	})
+	if err != nil {
+		return fmt.Errorf("OpenWithReader(%q in %q): %w", item.Header.Name, item.DriveFile.Name, err)
+	}
+	defer zfd.Close()
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return fmt.Errorf("MkdirAll(%q): %w", filepath.Dir(dst), err)
+	}
+	f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("OpenFile(%q): %w", dst, err)
+	}
+	if _, err := io.Copy(f, zfd); err != nil {
+		f.Close()
+		return fmt.Errorf("Copy(%q): %w", dst, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("Close(%q): %w", dst, err)
+	}
+	zfd.Close()
+	return nil
+}
+
+type FileAndReader struct {
+	File   *drive.File
+	Reader *ziputil.Reader
+}
+
+type DownloadableItem struct {
+	DriveFile *drive.File
+	Zip       *ziputil.Reader
+	Header    *ziputil.FileHeader
+}
+
+func (c *Client) readExportZipTOCs(ctx context.Context, exp *Export) (map[string]FileAndReader, error) {
+	zips := make(map[string]FileAndReader)
 	for i, f := range exp.Files {
 		if *verbose {
 			log.Printf("# reading TOC of zip %d/%d: %s ...", i+1, len(exp.Files), f.Name)
@@ -656,7 +759,7 @@ func (c *Client) readExportZipTOCs(ctx context.Context, exp *Export) (map[string
 		if err != nil {
 			return nil, fmt.Errorf("ParseTOC(%q): %w", f.Name, err)
 		}
-		zips[f.Name] = zr
+		zips[f.Name] = FileAndReader{File: f, Reader: zr}
 	}
 	return zips, nil
 }
