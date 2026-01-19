@@ -14,6 +14,7 @@ import (
 	"io"
 	"iter"
 	"log"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"go4.org/ziputil"
 	"golang.org/x/oauth2"
@@ -32,13 +34,51 @@ import (
 var scopes = []string{drive.DriveReadonlyScope}
 
 var (
-	driveFolder = flag.String("drive-folder", "", "Drive folder ID (or drive URL with ID) to read Takeout zips from. If empty, it uses the root 'Takeout' folder.")
+	driveFolder = flag.String("drive-folder", "", "If non-empty, only consider Takeouts in this exact Drive folder ID or URL. Default: all 'Takeout' folders in root.")
 	verbose     = flag.Bool("verbose", false, "verbose logging")
-	listZips    = flag.Bool("list-zips", false, "list zip files in the folder and exit")
 )
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `Usage: gtakeaway [flags] <mode>
+
+gtakeaway list
+gtakeaway stats <takeout-prefix>
+gtakeaway download <takeout-prefix> <local-dir>
+
+For example:
+
+  $ gtakeaway download takeout-20240101T120000Z $HOME/Takeout
+
+Flags:
+`)
+	flag.PrintDefaults()
+	os.Exit(1)
+}
 
 func main() {
 	flag.Parse()
+	args := flag.Args()
+	if len(args) == 0 {
+		usage()
+	}
+	mode := args[0]
+	switch mode {
+	case "list":
+		if len(args) != 1 {
+			usage()
+		}
+	case "stats":
+		if len(args) != 2 {
+			usage()
+		}
+	case "download":
+		if len(args) != 3 {
+			usage()
+		}
+	default:
+		usage()
+	}
+
 	ctx := context.Background()
 	confDir, err := os.UserConfigDir()
 	if err != nil {
@@ -77,44 +117,63 @@ func main() {
 		*driveFolder = (*driveFolder)[slash+1:]
 	}
 
-	if *driveFolder == "" {
-		takeoutFolders, err := c.TakeoutFolderIDs(ctx)
-		if err != nil {
-			log.Fatal(err)
-		}
-		switch len(takeoutFolders) {
-		case 0:
-			log.Fatalf("no Takeout folder(s) found under usual name & location; specify --drive-folder=<id> to pick one")
-		case 1:
-			*driveFolder = takeoutFolders[0].Id
-		default:
-			log.SetFlags(0)
-			log.Printf("Warning: multiple Takeout folders found; specify --drive-folder=<id> to pick one. Options:")
-			for _, f := range takeoutFolders {
-				date, _, _ := strings.Cut(f.CreatedTime, "T") // chop off time in "2023-06-13T11:33:56.701Z"
-				log.Printf("  %s https://drive.google.com/drive/u/0/folders/%s", date, f.Id)
-			}
-			os.Exit(1)
-		}
+	takeoutFolders, err := c.TakeoutFolders(ctx, *driveFolder)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	if *listZips {
-		zips, err := c.ListZipFiles(ctx, *driveFolder)
-		if err != nil {
-			log.Fatalf("listing zip files: %v", err)
+	exports, err := c.ExportsFromFolders(ctx, takeoutFolders)
+	if err != nil {
+		log.Fatalf("ExportsFromFolders: %v", err)
+	}
+
+	if len(exports) == 0 {
+		var ids []string
+		for _, df := range takeoutFolders {
+			ids = append(ids, df.Id)
 		}
-		var sum int64
-		for _, z := range zips {
-			fmt.Printf("%11d %s\n", z.Size, z.Name)
-			sum += z.Size
+		log.Fatalf("no Takeout exports found in folder(s) %v", ids)
+	}
+
+	if mode == "list" {
+		fmt.Printf("Exports:\n")
+		for _, exp := range exports {
+			fmt.Printf(" * %s (folder %s): %d zip files\n", exp.Prefix, exp.FolderID, len(exp.Files))
 		}
-		fmt.Printf("%d zip files; total size %d bytes (%.2f GB)\n", len(zips), sum, float64(sum)/(1<<30))
 		return
 	}
 
-	if err := c.List(ctx, *driveFolder); err != nil {
-		log.Fatalf("listing %v: %v", *driveFolder, err)
+	if mode == "stats" {
+		exportName := args[1]
+		exp, ok := exportWithName(exports, exportName)
+		if !ok {
+			log.Fatalf("no export found with name %q; run 'gtakeaway list' to see available exports", exportName)
+		}
+		if err := c.PrintExportStats(ctx, exp); err != nil {
+			log.Fatalf("PrintExportStats: %v", err)
+		}
+		return
+
 	}
+
+	// if *listZips {
+	// 	zips, err := c.ListZipFiles(ctx, *driveFolder)
+	// 	if err != nil {
+	// 		log.Fatalf("listing zip files: %v", err)
+	// 	}
+	// 	var sum int64
+	// 	for _, z := range zips {
+	// 		fmt.Printf("%11d %s\n", z.Size, z.Name)
+	// 		sum += z.Size
+	// 	}
+	// 	fmt.Printf("%d zip files; total size %d bytes (%.2f GB)\n", len(zips), sum, float64(sum)/(1<<30))
+	// 	return
+	// }
+
+	// if err := c.List(ctx, *driveFolder); err != nil {
+	// 	log.Fatalf("listing %v: %v", *driveFolder, err)
+	// }
+	log.Fatal("TODO")
 }
 
 func (c *Client) ListZipFiles(ctx context.Context, folderID string) ([]*drive.File, error) {
@@ -436,10 +495,14 @@ func saveToken(path string, token *oauth2.Token) error {
 	return json.NewEncoder(f).Encode(token)
 }
 
-func (c *Client) TakeoutFolderIDs(ctx context.Context) ([]*drive.File, error) {
+// TakeoutFolders returns either the provider folder (if optFolderID is
+// non-empty), or all folders named "Takeout" in the root.
+//
+// It returns an error if none is found.
+func (c *Client) TakeoutFolders(ctx context.Context, optFolderID string) ([]*drive.File, error) {
 	r, err := c.svc.Files.List().
 		Q("name = 'Takeout' and mimeType = 'application/vnd.google-apps.folder' and 'root' in parents and trashed = false").
-		Fields("files(id,name,createdTime)").
+		Fields("files(id,name,createdTime,mimeType)").
 		PageSize(10).
 		Do()
 	if err != nil {
@@ -449,5 +512,190 @@ func (c *Client) TakeoutFolderIDs(ctx context.Context) ([]*drive.File, error) {
 	slices.SortFunc(r.Files, func(a, b *drive.File) int {
 		return cmp.Compare(b.CreatedTime, a.CreatedTime)
 	})
-	return r.Files, nil
+
+	if optFolderID == "" {
+		if len(r.Files) == 0 {
+			return nil, fmt.Errorf("no Takeout folder(s) found under usual name & location; specify --drive-folder=<id> to pick alternate folder")
+		}
+		// By default, return all 1+ Takeout folders found.
+		return r.Files, nil
+	}
+
+	// If they specified an explicit folder ID, find and return just that one.
+	for _, f := range r.Files {
+		if f.Id == optFolderID {
+			return []*drive.File{f}, nil
+		}
+	}
+
+	// If they specified an explicit folder ID that we didn't find,
+	// assume they renamed it to something that wasn't "Takeout", and see
+	// if exists on Google Drive and is a folder.
+	f, err := c.svc.Files.Get(optFolderID).Fields("id,name,createdTime,mimeType").Do()
+	if err != nil {
+		switch len(r.Files) {
+		case 0:
+			return nil, fmt.Errorf("no Takeout folder found with ID %q: %v", optFolderID, err)
+		case 1:
+			return nil, fmt.Errorf("error reading Drive folder found with ID %q: %v\ndid you mean your Takeout folder %q ?", optFolderID, err, r.Files[0].Id)
+		default:
+			var opts []string
+			for _, f := range r.Files {
+				opts = append(opts, f.Id)
+			}
+			return nil, fmt.Errorf("error reading Drive folder found with ID %q: %v\ndid you mean one of your Takeout folders: %q ?", optFolderID, err, strings.Join(opts, ", "))
+		}
+	}
+	if f.MimeType != "application/vnd.google-apps.folder" {
+		return nil, fmt.Errorf("file with ID %q is not a folder (mimeType=%q)", optFolderID, f.MimeType)
+	}
+	return []*drive.File{f}, nil
+}
+
+type Export struct {
+	FolderID string // drive folder ID
+	Prefix   string // e.g. "takeout-20240101T120000Z"
+	Time     time.Time
+	Files    []*drive.File
+}
+
+const timeLayout = "20060102T150405Z"
+
+func (c *Client) ExportsFromFolders(ctx context.Context, folders []*drive.File) ([]*Export, error) {
+	var exports []*Export
+	for _, folder := range folders {
+		fexports, err := c.ExportsFromFolder(ctx, folder)
+		if err != nil {
+			return nil, fmt.Errorf("ExportsFromFolder(%q): %w", folder.Id, err)
+		}
+		exports = append(exports, fexports...)
+	}
+	slices.SortFunc(exports, func(a, b *Export) int {
+		if v := cmp.Compare(a.Prefix, b.Prefix); v != 0 {
+			return v
+		}
+		return cmp.Compare(a.FolderID, b.FolderID)
+	})
+	return exports, nil
+}
+
+func (c *Client) ExportsFromFolder(ctx context.Context, folder *drive.File) ([]*Export, error) {
+	zips, err := c.ListZipFiles(ctx, folder.Id)
+	if err != nil {
+		return nil, fmt.Errorf("listing zip files in folder %q: %w", folder.Id, err)
+	}
+	exportsMap := map[string]*Export{}
+	for _, df := range zips {
+		suf, ok := strings.CutPrefix(df.Name, "takeout-")
+		if !ok {
+			continue
+		}
+		dateStr, _, ok := strings.Cut(suf, "-")
+		if !ok {
+			continue
+		}
+		prefix := "takeout-" + dateStr
+		dt, err := time.Parse(timeLayout, dateStr)
+		if err != nil {
+			log.Printf("warning: ignoring unexpected filename %q: %v", df.Name, err)
+			continue
+		}
+		exp, ok := exportsMap[prefix]
+		if !ok {
+			exp = &Export{
+				FolderID: folder.Id,
+				Prefix:   prefix,
+				Time:     dt,
+			}
+			exportsMap[prefix] = exp
+		}
+		exp.Files = append(exp.Files, df)
+	}
+	exports := slices.Collect(maps.Values(exportsMap))
+	slices.SortFunc(exports, func(a, b *Export) int {
+		return cmp.Compare(a.Prefix, b.Prefix)
+	})
+	return exports, nil
+}
+
+func exportWithName(exports []*Export, name string) (*Export, bool) {
+	if i := slices.IndexFunc(exports, func(exp *Export) bool {
+		return exp.Prefix == name
+	}); i >= 0 {
+		return exports[i], true
+	}
+	return nil, false
+}
+
+func (c *Client) PrintExportStats(ctx context.Context, exp *Export) error {
+	var sumZips int64
+	for _, f := range exp.Files {
+		sumZips += f.Size
+	}
+	fmt.Printf("Export %q (folder %s): %d zip files (%v total compressed)\n", exp.Prefix, exp.FolderID, len(exp.Files), niceBytes(sumZips))
+
+	if *verbose {
+		log.Printf("# reading TOCs of %d zip files ...", len(exp.Files))
+	}
+	zips, err := c.readExportZipTOCs(ctx, exp)
+	if err != nil {
+		return fmt.Errorf("readExportZipTOCs: %w", err)
+	}
+	var numFiles int64
+	var sumUncompressed int64
+	var byType = make(map[string]int)
+	var folders = make(map[string]bool)
+	for _, zf := range zips {
+		for _, f := range zf.File {
+			numFiles++
+			sumUncompressed += int64(f.UncompressedSize64)
+			if ext := strings.ToLower(path.Ext(f.Name)); ext != "" {
+				byType[ext]++
+			}
+			dir := path.Dir(f.Name)
+			folders[dir] = true
+		}
+	}
+	fmt.Printf("  Contains %d dirs, %d files; total uncompressed size %v\n", len(folders), numFiles, niceBytes(sumUncompressed))
+	fmt.Printf("  File types:\n")
+	keys := slices.Collect(maps.Keys(byType))
+	slices.SortFunc(keys, func(a, b string) int {
+		return cmp.Compare(byType[b], byType[a]) // descending by count
+	})
+	for _, ext := range keys {
+		fmt.Printf("    %8d %s\n", byType[ext], ext)
+	}
+	return nil
+}
+
+func (c *Client) readExportZipTOCs(ctx context.Context, exp *Export) (map[string]*ziputil.Reader, error) {
+	zips := make(map[string]*ziputil.Reader)
+	for i, f := range exp.Files {
+		if *verbose {
+			log.Printf("# reading TOC of zip %d/%d: %s ...", i+1, len(exp.Files), f.Name)
+		}
+		toc, err := c.readZipTOC(ctx, f)
+		if err != nil {
+			return nil, fmt.Errorf("readZipTOC(%q): %w", f.Name, err)
+		}
+		zr, err := ziputil.ParseTOC(f.Size, toc)
+		if err != nil {
+			return nil, fmt.Errorf("ParseTOC(%q): %w", f.Name, err)
+		}
+		zips[f.Name] = zr
+	}
+	return zips, nil
+}
+
+func niceBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for n/div >= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
