@@ -21,6 +21,7 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +37,8 @@ var scopes = []string{drive.DriveReadonlyScope}
 var (
 	driveFolder = flag.String("drive-folder", "", "If non-empty, only consider Takeouts in this exact Drive folder ID or URL. Default: all 'Takeout' folders in root.")
 	verbose     = flag.Bool("verbose", false, "verbose logging")
+	wide        = flag.Int("wide", 10, "number of concurrent downloads")
+	dryRun      = flag.Bool("dry-run", false, "if true, don't actually download or delete anything; just print what would be done")
 )
 
 func usage() {
@@ -111,7 +114,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("NewClient: %v", err)
 	}
-	c.verbose = *verbose
+	if *verbose {
+		c.verbose = 1
+	}
+	if os.Getenv("GTAKEAWAY_VERBOSE") != "" {
+		c.verbose, _ = strconv.Atoi(os.Getenv("GTAKEAWAY_VERBOSE"))
+	}
+	c.wide = *wide
 
 	if slash := strings.LastIndexByte(*driveFolder, '/'); slash != -1 {
 		*driveFolder = (*driveFolder)[slash+1:]
@@ -249,11 +258,14 @@ func (c *Client) List(ctx context.Context, folderID string) error {
 
 type Client struct {
 	svc     *drive.Service
-	verbose bool
+	verbose int // 0 for off
+	wide    int // number of concurrent downloads
 }
 
 func NewClient(ctx context.Context, config *oauth2.Config, tok *oauth2.Token) (*Client, error) {
-	c := &Client{}
+	c := &Client{
+		wide: 10,
+	}
 	client := config.Client(ctx, tok)
 
 	svc, err := drive.NewService(ctx, option.WithHTTPClient(client))
@@ -343,7 +355,9 @@ func writeAtomic(filename string, data []byte, perm os.FileMode) error {
 }
 
 func (c *Client) readRange(ctx context.Context, fileID string, start, endInclusive int64) ([]byte, error) {
-	log.Printf("readRange: %s %d-%d (%d bytes)", fileID, start, endInclusive, endInclusive-start+1)
+	if c.verbose >= 2 {
+		log.Printf("readRange: %s %d-%d (%d bytes)", fileID, start, endInclusive, endInclusive-start+1)
+	}
 	if start < 0 || endInclusive < start {
 		return nil, fmt.Errorf("invalid range %d-%d", start, endInclusive)
 	}
@@ -379,7 +393,9 @@ func (c *Client) readRange(ctx context.Context, fileID string, start, endInclusi
 // Drive file's head revision. The caller is responsible for closing the
 // returned ReadCloser when the error is nil.
 func (c *Client) streamRange(ctx context.Context, df *drive.File, start, endInclusive int64) (io.ReadCloser, error) {
-	log.Printf("streamRange: %s %d-%d (%d bytes)", df.Id, start, endInclusive, endInclusive-start+1)
+	if c.verbose >= 2 {
+		log.Printf("streamRange: %s %d-%d (%d bytes)", df.Id, start, endInclusive, endInclusive-start+1)
+	}
 	if start < 0 || endInclusive < start {
 		return nil, fmt.Errorf("invalid range %d-%d", start, endInclusive)
 	}
@@ -425,7 +441,7 @@ func (c *Client) iterFolder(ctx context.Context, folderID string) iter.Seq2[*dri
 				yield(nil, err)
 				return
 			}
-			if c.verbose {
+			if c.verbose > 0 {
 				nFiles += len(r.Files)
 				log.Printf("# iterFolder(%s): got page of %d files; up to %d total\n", folderID, len(r.Files), nFiles)
 			}
@@ -694,17 +710,72 @@ func (c *Client) DownloadTakeout(ctx context.Context, exp *Export, localDir stri
 			})
 		}
 	}
+	slices.SortFunc(todo, func(a, b DownloadableItem) int {
+		return strings.Compare(a.Header.Name, b.Header.Name)
+	})
 
-	for _, item := range todo {
-		log.Printf("Downloading from zip %q ...", item.DriveFile.Name)
-		if path.Clean(item.Header.Name) != item.Header.Name {
-			return fmt.Errorf("invalid file name %q", item.Header.Name)
+	stats := func() {
+		log.Printf("Did %d/%d files (%.2f%%); %v/%v compressed (%0.2f%%)\n",
+			done.NumFiles, total.NumFiles,
+			100*float64(done.NumFiles)/float64(total.NumFiles),
+			niceBytes(done.BytesCompressed),
+			niceBytes(total.BytesCompressed),
+			100*float64(done.BytesCompressed)/float64(total.BytesCompressed),
+		)
+	}
+	if done.NumFiles > 0 {
+		stats()
+	}
+	if *dryRun {
+		log.Printf("Dry run; not downloading %d files.", len(todo))
+		return nil
+	}
+
+	type result struct {
+		item DownloadableItem
+		err  error
+	}
+	results := make(chan result)
+	sem := make(chan struct{}, c.wide)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		for _, item := range todo {
+			sem <- struct{}{}
+			go func() {
+				defer func() { <-sem }()
+
+				if path.Clean(item.Header.Name) != item.Header.Name {
+					results <- result{item: item, err: fmt.Errorf("invalid file name %q", item.Header.Name)}
+					return
+				}
+
+				log.Printf("Downloading %q (%v) from zip %q ...",
+					item.Header.Name,
+					niceBytes(int64(item.Header.UncompressedSize64)),
+					item.DriveFile.Name)
+				err := c.downloadItem(ctx, item, filepath.Join(localDir, item.Header.Name))
+				results <- result{item: item, err: err}
+			}()
 		}
-		dst := filepath.Join(localDir, item.Header.Name)
-		if err := c.downloadItem(ctx, item, dst); err != nil {
-			return fmt.Errorf("downloadItem(%q): %w", item.Header.Name, err)
+	}()
+
+	for range todo {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case res := <-results:
+			if res.err != nil {
+				return fmt.Errorf("downloadItem(%q): %w", res.item.Header.Name, res.err)
+			}
+			done.NumFiles++
+			done.BytesUncompressed += int64(res.item.Header.UncompressedSize64)
+			done.BytesCompressed += int64(res.item.Header.CompressedSize64)
+			stats()
 		}
 	}
+
 	return nil
 }
 
@@ -746,20 +817,54 @@ type DownloadableItem struct {
 }
 
 func (c *Client) readExportZipTOCs(ctx context.Context, exp *Export) (map[string]FileAndReader, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type result struct {
+		name string
+		far  FileAndReader
+		err  error
+	}
+	ch := make(chan result)
+	sem := make(chan struct{}, c.wide)
+	go func() {
+		for i, f := range exp.Files {
+			if *verbose {
+				log.Printf("# reading TOC of zip %d/%d: %s ...", i+1, len(exp.Files), f.Name)
+			}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			go func() {
+				defer func() { <-sem }()
+				toc, err := c.readZipTOC(ctx, f)
+				if err != nil {
+					ch <- result{name: f.Name, err: fmt.Errorf("readZipTOC(%q): %w", f.Name, err)}
+					return
+				}
+				zr, err := ziputil.ParseTOC(f.Size, toc)
+				if err != nil {
+					ch <- result{name: f.Name, err: fmt.Errorf("ParseTOC(%q): %w", f.Name, err)}
+					return
+				}
+				ch <- result{name: f.Name, far: FileAndReader{File: f, Reader: zr}}
+			}()
+		}
+	}()
+
 	zips := make(map[string]FileAndReader)
-	for i, f := range exp.Files {
-		if *verbose {
-			log.Printf("# reading TOC of zip %d/%d: %s ...", i+1, len(exp.Files), f.Name)
+	for range exp.Files {
+		select {
+		case res := <-ch:
+			if res.err != nil {
+				return nil, res.err
+			}
+			zips[res.name] = res.far
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		toc, err := c.readZipTOC(ctx, f)
-		if err != nil {
-			return nil, fmt.Errorf("readZipTOC(%q): %w", f.Name, err)
-		}
-		zr, err := ziputil.ParseTOC(f.Size, toc)
-		if err != nil {
-			return nil, fmt.Errorf("ParseTOC(%q): %w", f.Name, err)
-		}
-		zips[f.Name] = FileAndReader{File: f, Reader: zr}
 	}
 	return zips, nil
 }
